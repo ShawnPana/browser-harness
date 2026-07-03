@@ -71,7 +71,15 @@ BU_API = "https://api.browser-use.com/api/v3"
 REMOTE_ID = os.environ.get("BU_BROWSER_ID")
 RECONNECT_DELAYS = (0, 1, 2, 4, 8)  # ~15s of re-dial attempts before declaring the browser gone
 RECONNECT_COOLDOWN = 30  # after a failed reconnect, fail fast for this long instead of re-burning ~15s per request
-CDP_CALL_TIMEOUT = 60  # cap per CDP call so a hung browser surfaces an error instead of an IPC stall
+# Cap per CDP call so a hung page surfaces an error instead of an IPC stall.
+# 20s, not 60: a wedged renderer answers no faster at 60, and on a long task a
+# streak of hung evals at 60s each is instant wall-clock death (observed on
+# BU_Bench_V1 v2: repeated 60s Runtime.evaluate timeouts drove 9 task timeouts).
+CDP_CALL_TIMEOUT = int(os.environ.get("BH_CDP_TIMEOUT", "20"))
+CDP_CALL_TIMEOUTS = {  # per-method overrides: legitimately slow calls get more room
+    "Page.captureScreenshot": 45,
+    "Page.printToPDF": 60,
+}
 # Per-command CDP errors worth one inline retry on the same session — navigation
 # races where the page moved under the call and the context comes right back.
 TRANSIENT_CDP_ERRORS = (
@@ -465,17 +473,33 @@ class Daemon:
         after a reconnect the old session id is meaningless, so the retry must use
         the freshly attached session rather than replaying the stale one."""
         gen = self.gen
+        timeout = CDP_CALL_TIMEOUTS.get(method, CDP_CALL_TIMEOUT)
         try:
-            return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), CDP_CALL_TIMEOUT)
+            return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), timeout)
         except TimeoutError:
-            raise RuntimeError(f"cdp call {method} timed out after {CDP_CALL_TIMEOUT}s -- browser busy or hung; check the page state and retry")
+            await self._unhang(session_id)
+            raise RuntimeError(
+                f"cdp call {method} timed out after {timeout}s -- the page is busy or hung "
+                "(this is NOT a disconnect). I terminated any running JS on it. "
+                "capture_screenshot() to see the current state, then try a smaller/simpler action -- "
+                "avoid heavy JS in one call. If the page stays stuck: close_tab() + new_tab(url), or reconnect()."
+            )
         except Exception as e:
             if not _conn_dead(e):
                 raise
             await self._reconnect(gen, str(e))
             if use_default:
                 session_id = self.session
-            return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), CDP_CALL_TIMEOUT)
+            return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), timeout)
+
+    async def _unhang(self, session_id):
+        """Best-effort rescue of a wedged page after a call timeout: kill the running
+        JS and stop any load, so the NEXT call meets a live main thread instead of
+        re-rolling the dice on the same hung renderer."""
+        if not session_id:
+            return
+        for m in ("Runtime.terminateExecution", "Page.stopLoading"):
+            await _silent(asyncio.wait_for(self.cdp.send_raw(m, session_id=session_id), 3))
 
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise

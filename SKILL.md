@@ -98,6 +98,8 @@ If a command fails with a connection error anyway:
 
 `connection_status()` gives the daemon's live view (`{connected, browser_id, page}`) any time you're unsure what you're attached to.
 
+A `cdp call ... timed out` error is NOT a disconnect — the page is busy or hung, and the daemon has already terminated its running JS. Take a screenshot to see where things stand and use a smaller/simpler next action; if the page stays stuck, `close_tab()` + `new_tab(url)`. Do not respond to timeouts by re-running the same heavy call.
+
 ## Interaction Skills
 
 If you get stuck on a browser mechanic, check https://github.com/browser-use/browser-harness/tree/main/interaction-skills.

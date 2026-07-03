@@ -582,3 +582,62 @@ def test_unknown_protocol_error_is_not_retried():
 
     assert "No node with given id found" in resp["error"]
     assert len(d.cdp.calls) == 1
+
+
+class _HungCDP(_FakeCDP):
+    """Page-level calls hang forever; rescue calls answer instantly."""
+
+    async def send_raw(self, method, params=None, session_id=None):
+        self.calls.append((method, params, session_id))
+        if method in ("Runtime.terminateExecution", "Page.stopLoading"):
+            return {}
+        await asyncio.sleep(30)
+
+
+def test_hung_call_times_out_unhangs_page_and_says_not_a_disconnect(monkeypatch):
+    """BU_Bench_V1 v2 finding: 60s timeouts on a wedged renderer burned task
+    budgets, and nothing unwedged the page, so the next call hung too. The
+    timeout must be short, actively terminate the running JS, and tell the
+    agent this is a hang (screenshot + simpler action), not a disconnect."""
+    monkeypatch.setattr(daemon, "CDP_CALL_TIMEOUT", 0.05)
+    monkeypatch.setattr(daemon, "CDP_CALL_TIMEOUTS", {})
+    d = daemon.Daemon()
+    d.cdp = _HungCDP()
+    d.session = "s-1"
+    dials = []
+
+    async def no_dial(wait=30):
+        dials.append(1)
+
+    monkeypatch.setattr(d, "_dial", no_dial)
+
+    resp = asyncio.run(d.handle({"method": "Runtime.evaluate", "params": {"expression": "while(1){}"}}))
+
+    assert "timed out" in resp["error"]
+    assert "NOT a disconnect" in resp["error"]
+    rescue = [(m, s) for (m, _, s) in d.cdp.calls if m in ("Runtime.terminateExecution", "Page.stopLoading")]
+    assert rescue == [("Runtime.terminateExecution", "s-1"), ("Page.stopLoading", "s-1")], (
+        "the wedged page must be actively rescued, on the hung call's session"
+    )
+    assert dials == [], "a hang is not a dead socket -- no reconnect"
+
+
+def test_slow_call_methods_get_their_own_timeout(monkeypatch):
+    """Legitimately slow calls (full-page screenshots) must not be killed by the
+    short default cap — the per-method table must be consulted."""
+    monkeypatch.setattr(daemon, "CDP_CALL_TIMEOUT", 0.05)
+    monkeypatch.setattr(daemon, "CDP_CALL_TIMEOUTS", {"Page.captureScreenshot": 5})
+
+    class _SlowShotCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            await asyncio.sleep(0.2)  # slower than default cap, well under its own
+            return {"data": "iVBOR..."}
+
+    d = daemon.Daemon()
+    d.cdp = _SlowShotCDP()
+    d.session = "s-1"
+
+    resp = asyncio.run(d.handle({"method": "Page.captureScreenshot", "params": {}}))
+
+    assert resp["result"] == {"data": "iVBOR..."}
