@@ -318,8 +318,20 @@ def ensure_daemon(wait=60.0, name=None, env=None):
         # raw AF_UNIX here would fail on every warm call and churn the daemon.
         try:
             s, token = ipc.connect(name or NAME, timeout=3.0)
+            # A dead browser WS makes the daemon reconnect inline (~15s of re-dials)
+            # before it can answer this probe — give it room so a recoverable blip
+            # doesn't get escalated into a full daemon restart.
+            s.settimeout(45.0)
             resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}})
             if "result" in resp: return
+            if str(resp.get("error", "")).startswith("cdp_disconnected"):
+                # The daemon is alive and has already run its reconnect ladder —
+                # the BROWSER is unreachable, not the daemon. Restarting would burn
+                # 30s+ spawning a replacement that fails identically AND would
+                # swallow the daemon's actionable error. Let the script proceed;
+                # its first CDP call fails fast with the cdp_disconnected guidance,
+                # and the daemon auto-heals once the browser is back.
+                return
         except Exception: pass
         restart_daemon(name)
 
@@ -362,15 +374,20 @@ def stop_remote_daemon(name="remote"):
     # restarts anything on its own; a follow-up `browser-harness`
     # call would auto-spawn a fresh one via ensure_daemon(). That
     # "run-it-again-to-restart" workflow is why it was named that way.
-    restart_daemon(name)
+    restart_daemon(name, stop_browser=True)
 
 
-def restart_daemon(name=None):
+def restart_daemon(name=None, stop_browser=False):
     """Best-effort daemon shutdown + socket/pid cleanup.
 
     Name is historical: callers typically follow this with another
     `browser-harness` invocation, which auto-spawns a fresh daemon via
     ensure_daemon(). The function itself only stops.
+
+    stop_browser=False (the default) tells the daemon to KEEP its cloud browser
+    running and leave the connection descriptor in place, so the next daemon
+    reattaches to the same browser — a restart/self-heal must not destroy the
+    thing it is trying to recover. Only stop_remote_daemon() passes True.
 
     Identity is verified via ipc.identify() before any process signal, so
     a stale pid file whose number has been reused by an unrelated process
@@ -404,7 +421,7 @@ def restart_daemon(name=None):
     if daemon_alive:
         try:
             c, token = ipc.connect(name, timeout=5.0)
-            ipc.request(c, token, {"meta": "shutdown"})
+            ipc.request(c, token, {"meta": "shutdown", "stop_browser": stop_browser})
             c.close()
         except Exception:
             pass
@@ -437,6 +454,13 @@ def restart_daemon(name=None):
                     pass
 
     ipc.cleanup_endpoint(name)
+    if stop_browser:
+        # The daemon clears this on a clean stop; cover the daemon-already-dead case
+        # so a later daemon doesn't reattach to a browser the caller asked to stop.
+        try:
+            ipc.conn_path(name).unlink()
+        except FileNotFoundError:
+            pass
     try:
         os.unlink(pid_path)
     except FileNotFoundError:

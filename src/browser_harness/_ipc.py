@@ -52,6 +52,10 @@ def log_path(name):   return _TMP / f"{_tmp_stem(name)}.log"
 def pid_path(name):   return _RUNTIME / f"{_runtime_stem(name)}.pid"
 def port_path(name):  return _RUNTIME / f"{_runtime_stem(name)}.port"  # Windows-only: holds {"port","token"} JSON
 def _sock_path(name): return _RUNTIME / f"{_runtime_stem(name)}.sock"
+# Connection descriptor: how the daemon attached to its browser ({"browser_id","ws_url","source"}).
+# Deliberately NOT removed by cleanup_endpoint() — it must outlive the daemon process so a
+# restarted daemon can reattach to the same browser. Removed only on explicit browser stop.
+def conn_path(name):  return _RUNTIME / f"{_runtime_stem(name)}.conn"
 
 
 def _read_port_file(name):

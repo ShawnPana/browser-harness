@@ -293,3 +293,215 @@ def test_current_tab_meta_returns_not_attached_when_no_target_id():
     assert result == {"error": "not_attached"}
     # No CDP call should have been issued.
     assert d.cdp.calls == []
+
+
+# --- connection recovery (issue: remote WS death had no reconnect path) ---
+
+import time
+
+from websockets.exceptions import ConnectionClosedError
+
+
+class _DeadCDP:
+    """send_raw always raises like a closed websocket; records stop()."""
+
+    def __init__(self):
+        self.calls = []
+        self.stopped = False
+
+    async def send_raw(self, method, params=None, session_id=None):
+        self.calls.append((method, params, session_id))
+        raise ConnectionError("WebSocket connection closed")
+
+    async def stop(self):
+        self.stopped = True
+
+
+def test_conn_dead_classification():
+    """Only genuinely-dead-socket errors may trigger a reconnect. A CDP protocol
+    error or a slow call must NOT — reconnecting on those would tear down a
+    healthy connection mid-task."""
+    assert daemon._conn_dead(ConnectionError("WebSocket connection closed"))
+    assert daemon._conn_dead(RuntimeError("Client is not started. Call start() first."))
+    assert daemon._conn_dead(ConnectionClosedError(None, None))
+    assert not daemon._conn_dead(TimeoutError())
+    assert not daemon._conn_dead(RuntimeError("{'code': -32000, 'message': 'Node not found'}"))
+
+
+def test_dispatch_reconnects_retries_and_notices_tab_change(monkeypatch):
+    """A dead WS mid-dispatch must trigger one transparent reconnect + retry.
+    The retry must use the NEW default session (the old one died with the WS),
+    and the response must carry a one-shot notice when the attached tab changed."""
+    monkeypatch.setattr(daemon, "RECONNECT_DELAYS", (0,))
+    d = daemon.Daemon()
+    dead = _DeadCDP()
+    d.cdp = dead
+    d.session = "s-old"
+    d.target_id = "t-old"
+    healthy = _FakeCDP()
+
+    async def fake_dial(wait=30):
+        d.cdp = healthy
+        d.session = "s-new"
+        d.target_id = "t-new"
+        d.gen += 1
+
+    monkeypatch.setattr(d, "_dial", fake_dial)
+
+    resp = asyncio.run(d.handle({"method": "Runtime.evaluate", "params": {"expression": "1"}}))
+
+    assert resp["result"] == {}
+    assert healthy.calls == [("Runtime.evaluate", {"expression": "1"}, "s-new")], (
+        "retry must run on the freshly attached session, not replay the dead one"
+    )
+    assert dead.stopped, "the dead client must be stopped before re-dialing"
+    assert "tab" in resp.get("notice", ""), "tab change during recovery must be surfaced"
+    assert d.notice is None, "notice is one-shot"
+
+
+def test_reconnect_failure_returns_cdp_disconnected_guidance(monkeypatch):
+    """When every re-dial fails, the agent gets ONE actionable error naming the
+    recovery steps (reconnect(), then fresh browser) — not a generic traceback."""
+    monkeypatch.setattr(daemon, "RECONNECT_DELAYS", (0, 0))
+    d = daemon.Daemon()
+    d.cdp = _DeadCDP()
+    d.session = "s"
+    attempts = []
+
+    async def fail_dial(wait=30):
+        attempts.append(1)
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(d, "_dial", fail_dial)
+
+    resp = asyncio.run(d.handle({"method": "Page.navigate", "params": {"url": "https://x.test"}}))
+
+    assert resp["error"].startswith("cdp_disconnected")
+    assert "reconnect()" in resp["error"]
+    assert "sleep loop" in resp["error"]
+    assert len(attempts) == 2, "one dial per configured delay"
+    assert d.dead_at > 0, "failed reconnect must arm the cooldown"
+
+
+def test_reconnect_cooldown_fails_fast_without_redialing(monkeypatch):
+    """Within the cooldown after a failed reconnect, requests fail immediately
+    with the same guidance instead of burning ~15s of re-dials each."""
+    d = daemon.Daemon()
+    d.cdp = _DeadCDP()
+    d.session = "s"
+    d.dead_at = time.time()
+    d.dead_err = "connection refused"
+    attempts = []
+
+    async def fail_dial(wait=30):
+        attempts.append(1)
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(d, "_dial", fail_dial)
+
+    resp = asyncio.run(d.handle({"method": "Page.navigate", "params": {"url": "https://x.test"}}))
+
+    assert resp["error"].startswith("cdp_disconnected")
+    assert attempts == [], "cooldown must skip re-dialing entirely"
+
+
+def test_meta_reconnect_bypasses_cooldown(monkeypatch):
+    """reconnect() is the agent's explicit recovery action — it must re-dial even
+    when the automatic path is in its failure cooldown."""
+    monkeypatch.setattr(daemon, "RECONNECT_DELAYS", (0,))
+    d = daemon.Daemon()
+    d.cdp = _DeadCDP()
+    d.session = "s-old"
+    d.target_id = "t-old"
+    d.dead_at = time.time()
+    d.dead_err = "connection refused"
+
+    class _TargetInfoCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {"targetId": params["targetId"], "url": "https://x.test/", "title": "X", "type": "page"}}
+            return {}
+
+    async def fake_dial(wait=30):
+        d.cdp = _TargetInfoCDP()
+        d.session = "s-new"
+        d.target_id = "t-new"
+        d.gen += 1
+
+    monkeypatch.setattr(d, "_dial", fake_dial)
+
+    resp = asyncio.run(d.handle({"meta": "reconnect"}))
+
+    assert resp["reconnected"] is True
+    assert resp["page"]["url"] == "https://x.test/"
+    assert "tab" in resp.get("notice", "")
+
+
+def test_browser_gone_stops_retrying_immediately(monkeypatch):
+    """A stopped cloud browser is terminal — later delays must not be burned."""
+    monkeypatch.setattr(daemon, "RECONNECT_DELAYS", (0, 0, 0))
+    d = daemon.Daemon()
+    d.cdp = _DeadCDP()
+    d.session = "s"
+    attempts = []
+
+    async def gone_dial(wait=30):
+        attempts.append(1)
+        raise daemon.BrowserGone("cloud browser b-1 is stopped (timed out or was stopped)")
+
+    monkeypatch.setattr(d, "_dial", gone_dial)
+
+    resp = asyncio.run(d.handle({"method": "Page.navigate", "params": {"url": "https://x.test"}}))
+
+    assert resp["error"].startswith("cdp_disconnected")
+    assert "stopped" in resp["error"]
+    assert len(attempts) == 1
+
+
+def test_protocol_error_does_not_trigger_reconnect(monkeypatch):
+    """CDP protocol errors (bad selector, dead node, ...) are normal traffic —
+    they must surface unchanged, with zero re-dial attempts."""
+    class _ProtocolErrorCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            raise RuntimeError("{'code': -32000, 'message': 'Node not found'}")
+
+    d = daemon.Daemon()
+    d.cdp = _ProtocolErrorCDP()
+    d.session = "s"
+    attempts = []
+
+    async def fail_dial(wait=30):
+        attempts.append(1)
+
+    monkeypatch.setattr(d, "_dial", fail_dial)
+
+    resp = asyncio.run(d.handle({"method": "DOM.getDocument", "params": {}}))
+
+    assert "Node not found" in resp["error"]
+    assert attempts == []
+
+
+def test_shutdown_meta_stop_browser_flag():
+    """restart/self-heal shutdowns (stop_browser=False) must keep the cloud
+    browser; plain shutdowns keep the old stop-the-browser billing safety."""
+    d = daemon.Daemon()
+    d.stop = asyncio.Event()
+    asyncio.run(d.handle({"meta": "shutdown", "stop_browser": False}))
+    assert d.stop_browser_on_exit is False
+    assert d.stop.is_set()
+
+    d2 = daemon.Daemon()
+    d2.stop = asyncio.Event()
+    asyncio.run(d2.handle({"meta": "shutdown"}))
+    assert d2.stop_browser_on_exit is True
+
+
+def test_descriptor_roundtrip(tmp_path, monkeypatch):
+    """The connection descriptor must survive daemon death (that's its job) and
+    be removable on explicit browser stop."""
+    monkeypatch.setattr(daemon.ipc, "conn_path", lambda name: tmp_path / f"{name}.conn")
+    daemon.write_descriptor({"browser_id": "b-1", "ws_url": "ws://cloud.test/devtools/browser/x"})
+    assert daemon.read_descriptor() == {"browser_id": "b-1", "ws_url": "ws://cloud.test/devtools/browser/x"}
+    daemon.clear_descriptor()
+    assert daemon.read_descriptor() == {}

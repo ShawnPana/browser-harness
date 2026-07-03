@@ -87,6 +87,17 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 - Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.
 - Raw CDP is available with `cdp("Domain.method", ...)`.
 
+## Connection Recovery
+
+If the browser connection drops mid-task, the daemon reconnects automatically (~15s of retries, with a fresh cloud URL when it knows the browser id) and your command usually succeeds on its own. A `[browser-use] ...` notice on stderr means recovery happened but your tab changed — reorient with `list_tabs()`/`page_info()` before continuing.
+
+If a command fails with a connection error anyway:
+
+1. Call `reconnect()` once — it force-re-dials and reports where you're attached.
+2. If it raises `cdp_disconnected`, the browser session is gone. Do NOT sleep-and-retry in a loop. Start a fresh browser (`start_remote_daemon(...)` for cloud, or restart Chrome / get a new `BU_CDP_WS`) and redo the task from navigation.
+
+`connection_status()` gives the daemon's live view (`{connected, browser_id, page}`) any time you're unsure what you're attached to.
+
 ## Interaction Skills
 
 If you get stuck on a browser mechanic, check https://github.com/browser-use/browser-harness/tree/main/interaction-skills.

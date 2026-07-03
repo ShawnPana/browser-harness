@@ -8,6 +8,7 @@ from . import _ipc as ipc
 from . import auth
 from . import paths
 from cdp_use.client import CDPClient
+from websockets.exceptions import ConnectionClosed
 
 
 def _load_env():
@@ -68,6 +69,9 @@ PROFILES = [
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 BU_API = "https://api.browser-use.com/api/v3"
 REMOTE_ID = os.environ.get("BU_BROWSER_ID")
+RECONNECT_DELAYS = (0, 1, 2, 4, 8)  # ~15s of re-dial attempts before declaring the browser gone
+RECONNECT_COOLDOWN = 30  # after a failed reconnect, fail fast for this long instead of re-burning ~15s per request
+CDP_CALL_TIMEOUT = 60  # cap per CDP call so a hung browser surfaces an error instead of an IPC stall
 
 
 def log(msg):
@@ -102,14 +106,14 @@ def _ws_from_devtools_active_port(http_url: str) -> str | None:
     return None
 
 
-def get_ws_url():
+def get_ws_url(wait=30):
     if url := os.environ.get("BU_CDP_WS"):
         return url
     if url := os.environ.get("BU_CDP_URL"):
         # HTTP DevTools endpoint (e.g. http://127.0.0.1:9333) — resolve to ws via /json/version.
         # Use this for a dedicated automation Chrome on a non-default profile, which avoids the
         # M144 "Allow remote debugging" dialog and the M136 default-profile lockdown.
-        deadline = time.time() + 30
+        deadline = time.time() + wait
         last_err = None
         base_url = url.rstrip("/")
         while time.time() < deadline:
@@ -125,8 +129,8 @@ def get_ws_url():
             except Exception as e:
                 last_err = e
                 time.sleep(1)
-        raise RuntimeError(f"BU_CDP_URL={url} unreachable after 30s: {last_err} -- is the dedicated automation Chrome running?")
-    deadline = time.time() + 30
+        raise RuntimeError(f"BU_CDP_URL={url} unreachable after {wait}s: {last_err} -- is the dedicated automation Chrome running?")
+    deadline = time.time() + wait
     while time.time() < deadline:
         for base in PROFILES:
             try:
@@ -165,21 +169,90 @@ def get_ws_url():
     raise RuntimeError(f"DevToolsActivePort not found in {[str(p) for p in PROFILES]} — enable chrome://inspect/#remote-debugging, or set BU_CDP_WS for a remote browser")
 
 
-def stop_remote():
-    if not REMOTE_ID:
+def stop_remote(browser_id=None):
+    browser_id = browser_id or REMOTE_ID
+    if not browser_id:
         return
     try:
         key = auth.get_browser_use_api_key()
         req = urllib.request.Request(
-            f"{BU_API}/browsers/{REMOTE_ID}",
+            f"{BU_API}/browsers/{browser_id}",
             data=json.dumps({"action": "stop"}).encode(),
             method="PATCH",
             headers={"X-Browser-Use-API-Key": key, "Content-Type": "application/json"},
         )
         urllib.request.urlopen(req, timeout=15).read()
-        log(f"stopped remote browser {REMOTE_ID}")
+        log(f"stopped remote browser {browser_id}")
     except Exception as e:
-        log(f"stop_remote failed ({REMOTE_ID}): {e}")
+        log(f"stop_remote failed ({browser_id}): {e}")
+
+
+def _conn_dead(e):
+    """True when the CDP websocket is gone, as opposed to a normal CDP protocol error."""
+    if isinstance(e, TimeoutError):  # TimeoutError ⊂ OSError, but a slow call is not a dead socket
+        return False
+    if isinstance(e, (OSError, ConnectionClosed)):  # ConnectionError ⊂ OSError
+        return True
+    return isinstance(e, RuntimeError) and "Client is not started" in str(e)
+
+
+def _disc_err(e):
+    """Error string for a failed target probe, without double-prefixing a reconnect failure."""
+    msg = str(e)
+    return msg if msg.startswith("cdp_disconnected") else f"cdp_disconnected: {msg}"
+
+
+class BrowserGone(RuntimeError):
+    """The backing browser session ended — reconnecting cannot help."""
+
+
+def read_descriptor():
+    try:
+        return json.loads(ipc.conn_path(NAME).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def write_descriptor(d):
+    try:
+        ipc.conn_path(NAME).write_text(json.dumps(d))
+    except OSError as e:
+        log(f"write_descriptor failed: {e}")
+
+
+def clear_descriptor():
+    try:
+        ipc.conn_path(NAME).unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def fetch_remote_browser(browser_id):
+    """GET /browsers/{id}, or None when the API can't be reached."""
+    try:
+        key = auth.get_browser_use_api_key()
+        req = urllib.request.Request(f"{BU_API}/browsers/{browser_id}", headers={"X-Browser-Use-API-Key": key})
+        return json.loads(urllib.request.urlopen(req, timeout=15).read())
+    except Exception as e:
+        log(f"fetch_remote_browser failed ({browser_id}): {e}")
+        return None
+
+
+def _ws_from_cloud_browser(browser_id):
+    """Fresh WS URL for a live cloud browser; BrowserGone once it is stopped; None when unknown."""
+    browser = fetch_remote_browser(browser_id)
+    if browser is None:
+        return None
+    if browser.get("status") == "stopped":
+        raise BrowserGone(f"cloud browser {browser_id} is stopped (timed out or was stopped)")
+    if cdp_url := browser.get("cdpUrl"):
+        try:
+            return json.loads(
+                urllib.request.urlopen(f"{cdp_url.rstrip('/')}/json/version", timeout=15).read()
+            )["webSocketDebuggerUrl"]
+        except Exception as e:
+            log(f"cdpUrl re-resolve failed ({browser_id}): {e}")
+    return None
 
 
 def is_real_page(t):
@@ -194,6 +267,14 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
+        self.gen = 0  # bumps on every successful (re)connect; guards duplicate reconnects
+        self.relock = asyncio.Lock()
+        self.dead_at = 0.0  # time.time() of the last failed reconnect (cooldown anchor)
+        self.dead_err = ""
+        self.notice = None  # one-shot warning attached to the next response (e.g. "your tab changed")
+        self.browser_id = REMOTE_ID
+        self.browser_id_from_env = bool(REMOTE_ID)
+        self.stop_browser_on_exit = True  # cleared by a keep-browser shutdown (daemon restart)
 
     async def attach_first_page(self):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -238,11 +319,14 @@ class Daemon:
 
     async def start(self):
         self.stop = asyncio.Event()
-        url = get_ws_url()
-        log(f"connecting to {url}")
-        self.cdp = CDPClient(url)
+        if not self.browser_id and (bid := read_descriptor().get("browser_id")):
+            # A previous daemon for this BU_NAME was attached to a cloud browser —
+            # reattach to it (the env vars died with that process; the descriptor didn't).
+            self.browser_id = bid
         try:
-            await self.cdp.start()
+            await self._dial()
+        except RuntimeError:
+            raise  # resolve_ws_url()/get_ws_url() errors already carry actionable messages
         except Exception as e:
             if os.environ.get("BU_CDP_WS"):
                 raise RuntimeError(
@@ -251,7 +335,60 @@ class Daemon:
                     "If you use Browser Use cloud, verify auth and get a fresh URL via start_remote_daemon()."
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
-        await self.attach_first_page()
+
+    def _resolve_ws_url(self, wait):
+        """WS URL for (re)connecting. First dial honours the env exactly like before;
+        reconnects prefer a live API lookup by browser id, so they get a FRESH URL
+        (and a terminal BrowserGone once the cloud browser is stopped) instead of
+        re-dialing a frozen one forever."""
+        first = self.gen == 0
+        env_ws = os.environ.get("BU_CDP_WS")
+        if first and env_ws:
+            return env_ws
+        if self.browser_id:
+            try:
+                if ws := _ws_from_cloud_browser(self.browser_id):
+                    return ws
+            except BrowserGone:
+                if first and not self.browser_id_from_env:
+                    # Stale descriptor from an old cloud run — forget it and fall
+                    # through to normal discovery instead of bricking startup.
+                    log(f"descriptor browser {self.browser_id} is stopped; clearing")
+                    clear_descriptor()
+                    self.browser_id = None
+                else:
+                    raise
+        if env_ws:
+            return env_ws
+        if not os.environ.get("BU_CDP_URL") and (ws := read_descriptor().get("ws_url")):
+            return ws
+        return get_ws_url(wait=wait)
+
+    async def _dial(self, wait=30):
+        """One full connect: resolve the WS URL, handshake, tap events, attach a page."""
+        url = await asyncio.to_thread(self._resolve_ws_url, wait)  # can block polling for Chrome
+        log(f"connecting to {url}")
+        cdp = CDPClient(url)
+        await cdp.start()
+        self.cdp = cdp
+        try:
+            self._tap_events()
+            await self.attach_first_page()
+        except BaseException:
+            await _silent(cdp.stop())
+            raise
+        self.gen += 1
+        self.dead_at = 0.0
+        if self.browser_id or os.environ.get("BU_CDP_WS"):
+            # Persist how we're attached so a restarted daemon reattaches to the SAME
+            # browser instead of falling back to local discovery. Local-discovery
+            # connections are deliberately not persisted: their ws paths go stale on
+            # every Chrome restart and rediscovery is cheap.
+            write_descriptor({"browser_id": self.browser_id, "ws_url": url})
+        else:
+            clear_descriptor()
+
+    def _tap_events(self):
         orig = self.cdp._event_registry.handle_event
         mark_js = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
         async def tap(method, params, session_id=None):
@@ -264,6 +401,68 @@ class Daemon:
                 asyncio.create_task(_silent(asyncio.wait_for(self.cdp.send_raw("Runtime.evaluate", {"expression": mark_js}, session_id=self.session), timeout=2)))
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
+
+    def _dead_msg(self, detail):
+        return (
+            f"cdp_disconnected: lost the browser connection and automatic reconnect failed ({detail}). "
+            "Do NOT retry in a sleep loop. Call reconnect() once to force another attempt; if that "
+            "fails too the browser session is gone -- start a fresh one (start_remote_daemon() for "
+            "cloud, or restart Chrome / get a new BU_CDP_WS), then redo the task from navigation."
+        )
+
+    async def _reconnect(self, gen, why, force=False):
+        """Serialized re-dial after a dead WS. No-op when another request already reconnected."""
+        async with self.relock:
+            if self.gen != gen:
+                return
+            if not force and time.time() - self.dead_at < RECONNECT_COOLDOWN:
+                raise RuntimeError(self._dead_msg(self.dead_err))
+            log(f"cdp connection lost ({why}); reconnecting")
+            old_target = self.target_id
+            await _silent(self.cdp.stop())
+            last = None
+            for delay in RECONNECT_DELAYS:
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    await self._dial(wait=3)
+                    log(f"reconnected (attached {self.target_id})")
+                    if old_target and self.target_id != old_target:
+                        self.notice = (
+                            "browser connection recovered, but the tab you were on is gone -- "
+                            "now attached to a different tab. Use list_tabs()/switch_tab()/page_info() to reorient."
+                        )
+                    return
+                except BrowserGone as e:
+                    last = e
+                    break
+                except Exception as e:
+                    last = e
+                    log(f"reconnect attempt failed: {e}")
+                    if "permission-blocked" in str(e):
+                        break  # needs the user to click Allow; retrying can't help
+            self.dead_at = time.time()
+            self.dead_err = str(last)
+            raise RuntimeError(self._dead_msg(self.dead_err))
+
+    async def _cdp_send(self, method, params=None, session_id=None, use_default=False):
+        """send_raw with a per-call timeout and one transparent reconnect+retry when the WS died.
+
+        use_default marks requests that fell back to the daemon's default session:
+        after a reconnect the old session id is meaningless, so the retry must use
+        the freshly attached session rather than replaying the stale one."""
+        gen = self.gen
+        try:
+            return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), CDP_CALL_TIMEOUT)
+        except TimeoutError:
+            raise RuntimeError(f"cdp call {method} timed out after {CDP_CALL_TIMEOUT}s -- browser busy or hung; check the page state and retry")
+        except Exception as e:
+            if not _conn_dead(e):
+                raise
+            await self._reconnect(gen, str(e))
+            if use_default:
+                session_id = self.session
+            return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), CDP_CALL_TIMEOUT)
 
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
@@ -290,17 +489,17 @@ class Daemon:
             if not self.target_id:
                 return {"error": "not_attached"}
             try:
-                info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": self.target_id}))["targetInfo"]
-            except Exception:
-                return {"error": "cdp_disconnected"}
+                info = (await self._cdp_send("Target.getTargetInfo", {"targetId": self.target_id}))["targetInfo"]
+            except Exception as e:
+                return {"error": _disc_err(e)}
             return {"targetId": info.get("targetId"), "url": info.get("url", ""), "title": info.get("title", "")}
         if meta == "connection_status":
             if not self.target_id:
                 return {"error": "not_attached"}
             try:
-                info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": self.target_id}))["targetInfo"]
-            except Exception:
-                return {"error": "cdp_disconnected"}
+                info = (await self._cdp_send("Target.getTargetInfo", {"targetId": self.target_id}))["targetInfo"]
+            except Exception as e:
+                return {"error": _disc_err(e)}
             page = None
             if is_real_page(info):
                 page = {
@@ -308,7 +507,24 @@ class Daemon:
                     "title": info.get("title") or "(untitled)",
                     "url": info.get("url") or "",
                 }
-            return {"target_id": self.target_id, "session_id": self.session, "page": page}
+            return {"connected": True, "browser_id": self.browser_id, "target_id": self.target_id, "session_id": self.session, "page": page}
+        if meta == "reconnect":
+            # Explicit agent-initiated reconnect: bypasses the failure cooldown and
+            # re-dials even if the current connection looks alive (the agent knows
+            # something we may not). Same recovery primitive as connecting.
+            try:
+                await self._reconnect(self.gen, "explicit reconnect()", force=True)
+            except Exception as e:
+                return {"error": str(e)}
+            out = {"reconnected": True, "browser_id": self.browser_id}
+            try:
+                info = (await self._cdp_send("Target.getTargetInfo", {"targetId": self.target_id}))["targetInfo"]
+                out["page"] = {"targetId": info.get("targetId"), "url": info.get("url", ""), "title": info.get("title", "")}
+            except Exception:
+                pass
+            if self.notice:
+                out["notice"], self.notice = self.notice, None
+            return out
         if meta == "set_session":
             old_session = self.session
             self.session = req.get("session_id")
@@ -345,22 +561,39 @@ class Daemon:
             )))
             return {"session_id": self.session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
-        if meta == "shutdown":    self.stop.set(); return {"ok": True}
+        if meta == "shutdown":
+            # stop_browser=False (daemon restart/self-heal) keeps the cloud browser
+            # alive so the next daemon reattaches via the descriptor. Default True
+            # preserves the old billing-safety behavior for explicit stops/crashes.
+            self.stop_browser_on_exit = bool(req.get("stop_browser", True))
+            self.stop.set()
+            return {"ok": True}
 
         method = req["method"]
         params = req.get("params") or {}
         # Browser-level Target.* calls must not use a session (stale or otherwise).
         # For everything else, explicit session in req wins; else default.
-        sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
+        explicit = req.get("session_id")
+        sid = None if method.startswith("Target.") else (explicit or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            out = {"result": await self._cdp_send(method, params, session_id=sid, use_default=bool(sid and not explicit))}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid == self.session and sid:
                 log(f"stale session {sid}, re-attaching")
                 if await self.attach_first_page():
-                    return {"result": await self.cdp.send_raw(method, params, session_id=self.session)}
-            return {"error": msg}
+                    self.notice = (
+                        "the tab you were on is gone -- re-attached to another tab. "
+                        "Use list_tabs()/switch_tab()/page_info() to reorient."
+                    )
+                    out = {"result": await self.cdp.send_raw(method, params, session_id=self.session)}
+                else:
+                    return {"error": msg}
+            else:
+                return {"error": msg}
+        if self.notice:
+            out["notice"], self.notice = self.notice, None
+        return out
 
 
 async def serve(d):
@@ -396,8 +629,12 @@ async def serve(d):
         ipc.cleanup_endpoint(NAME)
 
 
+DAEMON = None
+
+
 async def main():
-    d = Daemon()
+    global DAEMON
+    DAEMON = d = Daemon()
     await d.start()
     await serve(d)
 
@@ -422,6 +659,11 @@ if __name__ == "__main__":
         log(f"fatal: {e}")
         sys.exit(1)
     finally:
-        stop_remote()
+        # Keep-browser shutdowns (daemon restart/self-heal) skip the stop so the next
+        # daemon can reattach via the descriptor; crashes and explicit stops keep the
+        # old kill-the-billed-browser safety behavior.
+        if DAEMON is None or DAEMON.stop_browser_on_exit:
+            stop_remote(DAEMON.browser_id if DAEMON else None)
+            clear_descriptor()
         try: os.unlink(PID)
         except FileNotFoundError: pass

@@ -43,9 +43,15 @@ INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension
 def _send(req):
     c, token = ipc.connect(NAME, timeout=5.0)
     try:
+        # Reads get a longer budget than the 5s connect: the daemon caps CDP calls
+        # at 60s and may spend ~15s re-dialing a dropped browser WS before it can
+        # answer — dying at 5s would turn a recoverable blip into a hard failure.
+        c.settimeout(120.0)
         r = ipc.request(c, token, req)
     finally:
         c.close()
+    if isinstance(r, dict) and r.get("notice"):
+        print(f"[browser-use] {r['notice']}", file=sys.stderr)
     if "error" in r: raise RuntimeError(r["error"])
     return r
 
@@ -353,6 +359,25 @@ def iframe_target(url_substr):
         if t["type"] == "iframe" and url_substr in t.get("url", ""):
             return t["targetId"]
     return None
+
+
+# --- connection ---
+def connection_status():
+    """The daemon's live view of its browser connection.
+
+    Returns {connected, browser_id, target_id, session_id, page}. Probes with a
+    real CDP call (never a bare ping), so a healthy return means the browser is
+    actually reachable. Raises with a cdp_disconnected message when it isn't."""
+    return _send({"meta": "connection_status"})
+
+def reconnect():
+    """Force the daemon to re-dial the browser NOW.
+
+    Bypasses the failure cooldown; for a cloud browser the daemon re-resolves a
+    fresh CDP URL via the API. Returns {reconnected, browser_id, page}. Raises
+    with guidance when the browser session is gone — in that case start a fresh
+    browser (start_remote_daemon() / new BU_CDP_WS) instead of retrying."""
+    return _send({"meta": "reconnect"})
 
 
 # --- utility ---
