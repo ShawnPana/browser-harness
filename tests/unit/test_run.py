@@ -252,3 +252,42 @@ def test_cli_doctor_rejects_unknown_flags():
             run.main()
     assert ei.value.code == 2
     assert "usage" in err.getvalue().lower()
+
+
+# --- failure surfacing (BU_Bench_V1 finding: cdp_disconnected guidance was
+# emitted at the bottom of a stderr traceback and head-truncation ate it —
+# 0/100 traces contained it. Message must be FIRST, on stdout.) ---
+
+def test_print_failure_puts_message_first_on_stdout(capsys):
+    try:
+        exec("x = 1\nraise RuntimeError('cdp_disconnected: lost the browser connection ... call reconnect()')")
+    except RuntimeError as e:
+        run._print_failure(e)
+    out = capsys.readouterr()
+    first_line = out.out.splitlines()[0]
+    assert first_line == "browser-use failed: cdp_disconnected: lost the browser connection ... call reconnect()"
+    assert "Traceback" not in out.out, "raw tracebacks bury the message below the truncation point"
+    assert "line 2" in out.out, "the agent's own snippet line must be kept for real code bugs"
+    assert first_line in out.err, "message must land on stderr too"
+
+
+def test_print_failure_names_class_for_non_runtime_errors(capsys):
+    try:
+        exec("undefined_helper()")
+    except NameError as e:
+        run._print_failure(e)
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("browser-use failed: NameError:")
+
+
+def test_main_exits_1_with_legible_error_when_snippet_raises(capsys):
+    fake_stdin = StringIO("raise RuntimeError('cdp_disconnected: browser gone -- start a fresh one')")
+    with patch.object(sys, "argv", ["browser-harness"]), \
+         patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.print_update_banner"), \
+         patch("sys.stdin", fake_stdin):
+        with pytest.raises(SystemExit) as exc:
+            run.main()
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "browser-use failed: cdp_disconnected: browser gone -- start a fresh one"

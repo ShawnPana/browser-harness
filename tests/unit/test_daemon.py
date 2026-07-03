@@ -505,3 +505,80 @@ def test_descriptor_roundtrip(tmp_path, monkeypatch):
     assert daemon.read_descriptor() == {"browser_id": "b-1", "ws_url": "ws://cloud.test/devtools/browser/x"}
     daemon.clear_descriptor()
     assert daemon.read_descriptor() == {}
+
+
+def test_transient_context_destroyed_retries_once_same_session():
+    """Navigation races ('Execution context was destroyed') are the bulk of real
+    per-command eval failures — one inline retry on the same session turns them
+    from agent-visible exit-1s into non-events."""
+    class _FlakyCDP(_FakeCDP):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("{'code': -32000, 'message': 'Execution context was destroyed.'}")
+            return {"ok": True}
+
+    d = daemon.Daemon()
+    d.cdp = _FlakyCDP()
+    d.session = "s-1"
+
+    resp = asyncio.run(d.handle({"method": "Runtime.evaluate", "params": {"expression": "1"}}))
+
+    assert resp["result"] == {"ok": True}
+    assert [s for (_, _, s) in d.cdp.calls] == ["s-1", "s-1"], "retry stays on the same session"
+    assert "notice" not in resp, "a healed navigation race needs no agent-facing notice"
+
+
+def test_tab_gone_reattaches_retries_and_notices(monkeypatch):
+    """'Target closed' means the attached tab died while the browser lives — the
+    daemon must re-attach to a real page, retry there, and TELL the agent."""
+    class _TabDeadCDP(_FakeCDP):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("{'code': -32000, 'message': 'Target closed.'}")
+            return {"ok": True}
+
+    d = daemon.Daemon()
+    d.cdp = _TabDeadCDP()
+    d.session = "s-dead"
+    d.target_id = "t-dead"
+
+    async def fake_attach():
+        d.session = "s-fresh"
+        d.target_id = "t-fresh"
+        return {"targetId": "t-fresh", "url": "about:blank", "type": "page"}
+
+    monkeypatch.setattr(d, "attach_first_page", fake_attach)
+
+    resp = asyncio.run(d.handle({"method": "Page.captureScreenshot", "params": {}}))
+
+    assert resp["result"] == {"ok": True}
+    assert d.cdp.calls[-1][2] == "s-fresh", "retry must run on the re-attached session"
+    assert "tab" in resp.get("notice", ""), "silent tab teleport is the failure mode we're killing"
+
+
+def test_unknown_protocol_error_is_not_retried():
+    """Genuine CDP errors (bad node id, etc.) must surface immediately — one
+    call, no retry, no reconnect."""
+    class _OnceCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            raise RuntimeError("{'code': -32000, 'message': 'No node with given id found'}")
+
+    d = daemon.Daemon()
+    d.cdp = _OnceCDP()
+    d.session = "s-1"
+
+    resp = asyncio.run(d.handle({"method": "DOM.resolveNode", "params": {"nodeId": 9}}))
+
+    assert "No node with given id found" in resp["error"]
+    assert len(d.cdp.calls) == 1

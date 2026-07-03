@@ -72,6 +72,19 @@ REMOTE_ID = os.environ.get("BU_BROWSER_ID")
 RECONNECT_DELAYS = (0, 1, 2, 4, 8)  # ~15s of re-dial attempts before declaring the browser gone
 RECONNECT_COOLDOWN = 30  # after a failed reconnect, fail fast for this long instead of re-burning ~15s per request
 CDP_CALL_TIMEOUT = 60  # cap per CDP call so a hung browser surfaces an error instead of an IPC stall
+# Per-command CDP errors worth one inline retry on the same session — navigation
+# races where the page moved under the call and the context comes right back.
+TRANSIENT_CDP_ERRORS = (
+    "Execution context was destroyed",
+    "Cannot find context",
+    "Inspected target navigated or closed",
+)
+# The attached tab itself died — re-attach to a real page and retry there.
+TAB_GONE_ERRORS = (
+    "Session with given id not found",
+    "Target closed",
+    "Session closed",
+)
 
 
 def log(msg):
@@ -579,9 +592,18 @@ class Daemon:
             out = {"result": await self._cdp_send(method, params, session_id=sid, use_default=bool(sid and not explicit))}
         except Exception as e:
             msg = str(e)
-            if "Session with given id not found" in msg and sid == self.session and sid:
-                log(f"stale session {sid}, re-attaching")
-                if await self.attach_first_page():
+            on_default = bool(sid and sid == self.session)
+            try:
+                if on_default and any(t in msg for t in TRANSIENT_CDP_ERRORS):
+                    # Navigation race: the page moved under the call and destroyed
+                    # its JS context. The context comes right back — retry once.
+                    log(f"transient cdp error ({msg[:80]}), retrying once")
+                    await asyncio.sleep(0.5)
+                    out = {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+                elif on_default and any(t in msg for t in TAB_GONE_ERRORS):
+                    log(f"attached tab gone ({msg[:80]}), re-attaching")
+                    if not await self.attach_first_page():
+                        return {"error": msg}
                     self.notice = (
                         "the tab you were on is gone -- re-attached to another tab. "
                         "Use list_tabs()/switch_tab()/page_info() to reorient."
@@ -589,8 +611,8 @@ class Daemon:
                     out = {"result": await self.cdp.send_raw(method, params, session_id=self.session)}
                 else:
                     return {"error": msg}
-            else:
-                return {"error": msg}
+            except Exception as retry_err:
+                return {"error": str(retry_err)}
         if self.notice:
             out["notice"], self.notice = self.notice, None
         return out

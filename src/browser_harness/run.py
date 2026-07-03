@@ -94,6 +94,30 @@ def _print_skill():
     print(resources.files("browser_harness").joinpath("SKILL.md").read_text(), end="")
 
 
+def _print_failure(e):
+    """Agent-legible failure: the error MESSAGE first, on stdout, then only the
+    frames from the agent's own snippet.
+
+    A raw Python traceback puts the punchline (e.g. the cdp_disconnected
+    guidance) at the BOTTOM of ~6 frames of harness internals on stderr —
+    and agent tool-output capture truncates from the head, so the agent sees
+    frames 1-2 and a bare exit code, never the actual error. Observed on
+    BU_Bench_V1: 0/100 traces contained the guidance the daemon emitted.
+    Message-first on BOTH streams survives head-truncation; snippet frames
+    keep line numbers for genuine agent-code bugs without burying the error."""
+    import traceback
+    msg = str(e) or type(e).__name__
+    if not isinstance(e, RuntimeError):  # helper RuntimeErrors are self-explanatory
+        msg = f"{type(e).__name__}: {msg}"
+    lines = [f"browser-use failed: {msg}"]
+    for f in traceback.extract_tb(e.__traceback__):
+        if f.filename == "<string>":
+            lines.append(f"  in your snippet, line {f.lineno}: {(f.line or '').strip()}".rstrip(": "))
+    out = "\n".join(lines)
+    print(out, flush=True)
+    print(out, file=sys.stderr, flush=True)
+
+
 def _telemetry_command(args):
     if not args:
         return "script"
@@ -167,17 +191,23 @@ def main():
     # cloud API calls, parent agents managing their own session). An explicit BU_CDP_URL
     # or BU_CDP_WS also blocks the spawn so we honour the precedence install.md promises.
     cloud_admin = code.lstrip().startswith(("start_remote_daemon(", "stop_remote_daemon("))
-    if not cloud_admin:
-        if (
-            not daemon_alive()
-            and not _local_chrome_listening()
-            and not _explicit_cdp_configured()
-            and _cloud_auth_configured()
-            and os.environ.get("BU_AUTOSPAWN")
-        ):
-            start_remote_daemon(NAME)
-        ensure_daemon()
-    exec(code, globals())
+    try:
+        if not cloud_admin:
+            if (
+                not daemon_alive()
+                and not _local_chrome_listening()
+                and not _explicit_cdp_configured()
+                and _cloud_auth_configured()
+                and os.environ.get("BU_AUTOSPAWN")
+            ):
+                start_remote_daemon(NAME)
+            ensure_daemon()
+        exec(code, globals())
+    except SystemExit:
+        raise
+    except BaseException as e:
+        _print_failure(e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
